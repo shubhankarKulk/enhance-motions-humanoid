@@ -1,0 +1,550 @@
+import numpy as np
+import os
+import sys
+import torch
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from gymnasium.envs.mujoco import MujocoEnv
+from gymnasium import utils
+from gymnasium import spaces
+from utils.envUtils import *
+from utils.mocapTransform import MocapDM
+from utils.mocapUtils import *
+from utils.transformUtils import *
+import mujoco
+from scipy.linalg import cho_solve, cho_factor
+import json
+
+class HumanoidEnv(MujocoEnv, utils.EzPickle):
+    metadata = {
+        "render_modes": [
+            "human",
+            "rgb_array",
+            "depth_array",
+        ],
+        "render_fps": 67,
+    }
+    
+    def __init__(self, modelPath, filePath, render_mode = None):
+        self.frame_skip = 5
+        MujocoEnv.__init__(self,
+                        model_path=modelPath, 
+                        frame_skip=self.frame_skip,
+                        observation_space=None,
+                        render_mode=render_mode)
+        
+        self.terminate_when_unhealthy = True
+        self.action_dim = 30
+        self.state_dim = 148
+        low = np.full(self.action_dim, -1, dtype=np.float32)
+        high = np.full(self.action_dim, 1, dtype=np.float32)
+
+        self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float64)
+        
+        self.motion = MocapDM()
+        self.idx_curr = -1
+        self.expert = None
+        
+        self.body_qposaddr = get_body_qpos_addr(self.model)
+        self.bquat = self.get_body_quat()
+        self.prev_bquat = None
+        self.r_height = 0.0
+        self.imitation_r = 0.0
+
+        self.load_mocap(filePath)
+        self.curriculum_max = self.mocap_data_len # Full motion length
+        self.curriculum_len = self.mocap_data_len * 10
+        self.start_ind = 0
+        self.cur_t = 0
+        self.rewards = [0, 0, 0, 0, 0, 0]
+        self.stableRootPos = [-0.00120667, 0 , 0.91074869]
+
+        self.joint_names = ['chest_x', 'chest_y', 'chest_z', 'neck_x', 'neck_y', 'neck_z',
+                           'right_shoulder_x', 'right_shoulder_y', 'right_shoulder_z', 'right_elbow',
+                           'left_shoulder_x', 'left_shoulder_y', 'left_shoulder_z', 'left_elbow',
+                           'right_hip_x', 'right_hip_y', 'right_hip_z', 'right_knee',
+                           'right_ankle_x', 'right_ankle_y', 'right_ankle_z',
+                           'left_hip_x', 'left_hip_y', 'left_hip_z', 'left_knee',
+                           'left_ankle_x', 'left_ankle_y', 'left_ankle_z']
+
+        self.joint_ids = [self.model.joint(j).id for j in self.joint_names]
+        self.actuator_ids = [self.model.actuator(j).id for j in self.joint_names]
+        self.joint_ranges = np.array([self.model.jnt_range[j] for j in self.joint_ids])
+
+        self.calculate_kp_jd()
+
+        self.expert_ee_sites = [
+            "expert_right_ankle",
+            "expert_left_ankle",
+            "expert_right_wrist",
+            "expert_left_wrist"
+        ]
+
+        self.body_names_to_check = [
+            "chest", "neck", "right_elbow", "right_hip", "right_knee",
+            "right_shoulder", "right_wrist", "left_elbow", "left_hip",
+            "left_knee", "left_shoulder", "left_wrist", "right_ankle",
+            "left_ankle"
+        ]
+        # Verify that the sites exist in the model
+        for site_name in self.expert_ee_sites:
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name) == -1:
+                raise ValueError(f"Site '{site_name}' not found in the MuJoCo model. Check the XML file.")
+
+        self.floor_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        if self.floor_geom_id == -1:
+            raise ValueError("Floor geom not found in the model. Check XML file.")
+        
+        self.humanoid_com_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "humanoid_com")
+        self.expert_com_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "expert_com")
+        self.ee_site_ids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, s) for s in self.expert_ee_sites]
+        self.ndof = self.model.actuator_ctrlrange.shape[0]
+        self.pos_err = 0.0
+        self.vel_err = 0.0
+        self.max_torque = 0.0
+        self.fixed_start = False
+        self.max_distance = 0.0
+        
+        self.set_mode = None
+        self.right_knee_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "right_knee")
+        self.left_knee_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "left_knee")
+        self.right_toe_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "right_toe")
+        self.left_toe_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "left_toe")
+        
+
+    @property
+    def is_healthy(self):
+        min_z, max_z = [0.3, 2.5]
+        # print(self.data.qpos[2])
+        is_healthy = min_z < self.data.qpos[2] < max_z
+        
+        return is_healthy
+
+    @property
+    def terminated(self):
+        terminated = (not self.is_healthy) if self.terminate_when_unhealthy else False
+        return terminated
+    
+    def calculate_kp_jd(self):
+        self.kp = np.zeros(self.action_dim)
+        self.kd = np.zeros(self.action_dim)
+        for i, joint_name in enumerate(self.joint_names):
+            if joint_name in PARAMS_KP_KD:
+                kp, kd = PARAMS_KP_KD[joint_name]
+                self.kp[i] = kp
+                self.kd[i] = kd
+
+    def get_phaseEval(self):
+        phase = self.idx_curr / (self.mocap_data_len - 1)
+        return np.clip(phase, 0.0, 1.0)
+    
+    def get_ee_index(self):
+        return self.idx_curr % self.mocap_data_len
+        
+    def get_phase(self):
+        ind = self.get_expert_index(self.cur_t)
+        phase = ind / self.mocap_data_len
+        return phase
+    
+    def get_expert_index(self, t):
+        return self.start_ind + t
+    
+    def get_body_quat(self):
+        qpos = self.data.qpos.copy()
+        body_quat = [qpos[3:7]]
+        body_names = [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(self.model.nbody)]
+        for body in body_names[1:]:
+            if body == 'root' or not body in self.body_qposaddr or body == "right_toe" or body == "left_toe":
+                continue
+            start, end = self.body_qposaddr[body]
+            euler = np.zeros(3)
+            euler[:end - start] = qpos[start:end]
+            quat = quaternion_from_euler(euler[0], euler[1], euler[2])
+            body_quat.append(quat)
+        body_quat = np.concatenate(body_quat)
+        return body_quat
+
+    def _get_obs(self):
+        data = self.data
+        qpos = data.qpos.copy()
+        qvel = data.qvel.copy()
+        root_pos = qpos[:3].copy()
+        root_quat = qpos[3:7].copy()
+        root_mat = quatMat(root_quat)
+        qvel[:3] = get_quaternion_headingEnv(qvel[:3], root_quat).ravel()
+        qvel[3:6] = np.dot(root_mat.T, qvel[3:6])  # Root angular velocity in local frame
+        
+        # Relative positions
+        rel_pos = []
+        for i in range(1, self.model.nbody):
+            pos = data.xpos[i].copy() - root_pos
+            pos = np.dot(root_mat.T, pos)
+            rel_pos.append(pos)
+        rel_pos = np.array(rel_pos).flatten()
+        
+        # Body quaternions
+        bquat = self.get_body_quat()
+        
+        # Joint velocities
+        joint_vel = qvel[6:]
+        
+        # Phase
+        phase = self.get_phase()
+        
+        obs = np.concatenate([
+            rel_pos,           # Relative link positions
+            bquat.flatten(),   # Body quaternions
+            qvel[:3],          # Root linear velocity
+            qvel[3:6],         # Root angular velocity
+            joint_vel,         # Joint velocities
+            [phase]            # Phase
+        ])
+        return obs
+    
+    def load_mocap(self, filepath):
+        self.motion.load_mocap(filepath)
+        self.mocap_dt = self.motion.dt
+        self.mocap_data_len = len(self.motion.dataset)   
+        with open("motions/humanoid3d_jump_with_toes.txt", "r") as f:
+            self.motion.data_config = np.array(json.load(f))
+        with open("motions/humanoid3d_jump_with_toes_vel.txt", "r") as f:
+            self.motion.data_vel = np.array(json.load(f))     
+        self.expert = self.motion.getExpert(self, self.motion.data_config, mode="toe")
+
+    def check_floor_contact(self):
+        contacts = {}
+        for body_name in self.body_names_to_check:
+            contacts[body_name] = False
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id == -1:
+                continue  # Skip if body not found
+            # Get geom IDs associated with this body
+            geom_ids = []
+            for geom_id in range(self.model.ngeom):
+                if self.model.geom_bodyid[geom_id] == body_id:
+                    geom_ids.append(geom_id)
+            
+            # Check all contacts in the simulation
+            for i in range(self.data.ncon):
+                contact = self.data.contact[i]
+                # Check if one of the geoms is the floor and the other is from this body
+                if (contact.geom1 == self.floor_geom_id and contact.geom2 in geom_ids) or \
+                   (contact.geom2 == self.floor_geom_id and contact.geom1 in geom_ids):
+                    contacts[body_name] = True
+                    break
+        
+        return contacts
+    
+    def get_com(self):
+        return self.data.subtree_com[0, :].copy()
+
+    def get_ee_pos(self):
+        ee_name = ["right_ankle", "left_ankle", "right_wrist", "left_wrist"]
+        ee_pos = []
+        for name in ee_name:
+            bone_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            bone_vec = self.data.xpos[bone_id]
+            ee_pos.append(bone_vec)
+        return np.concatenate(ee_pos)
+
+    def get_angvel(self, prev_bquat, cur_bquat, dt):
+        q_diff = multi_quat_diff(cur_bquat, prev_bquat)
+        n_joint = q_diff.shape[0] // 4
+        body_angvel = np.zeros(n_joint * 3)
+        for i in range(n_joint):
+            body_angvel[3*i: 3*i + 3] = rotation_from_quaternion(q_diff[4*i: 4*i + 4]) / dt
+        return body_angvel
+    
+    def get_expert_attr(self, attr, ind):
+        ind = min(ind, self.mocap_data_len - 1) 
+        return self.expert[attr][ind]
+         
+    def reward(self):
+        t = self.cur_t
+        ind = self.get_expert_index(t)
+
+        if ind > self.mocap_data_len - 1:
+            ind = self.mocap_data_len - 1
+
+        prev_bquat = self.prev_bquat
+
+        if prev_bquat is None:
+            prev_bquat = self.bquat.copy()
+        # Current state
+        cur_com = self.get_com()
+        cur_bquat = self.get_body_quat()
+        cur_bangvel = self.get_angvel(prev_bquat, cur_bquat, self.dt)
+        cur_ee = self.get_ee_pos()
+
+        # Reference state
+        e_ee = self.get_expert_attr('ee_pos', ind)
+        e_bquat = self.get_expert_attr('bquat', ind)
+        e_bangvel = self.get_expert_attr('bangvel', ind)
+        e_com = self.get_expert_attr('com', ind)
+
+        # Pose reward
+        pose_r = compute_pose_reward(cur_bquat, e_bquat)
+        vel_r = compute_velocity_reward(cur_bangvel[3:], e_bangvel[3:])
+        ee_r = compute_end_effector_reward(cur_ee, e_ee)
+        com_r = compute_com_reward(cur_com, e_com)
+
+        w_p, w_v, w_e, w_c = 0.6, 0.1, 0.15, 0.15
+        imitation_r = w_p * pose_r + w_v * vel_r + w_e * ee_r + w_c * com_r
+        self.imitation_r = imitation_r
+        # Task reward
+        cur_z = self.data.qpos[2]
+        e_z = self.get_expert_attr('qpos', ind)[2]
+        r_height = com_height_reward(cur_z, e_z)
+        self.r_height = r_height
+
+        phase = self.get_phase()
+
+        r_toe = 0.0
+        if 0.2 <= phase <= 0.4:
+            right_toe_angle = self.data.qpos[self.right_toe_id]
+            left_toe_angle = self.data.qpos[self.left_toe_id]
+            target_plantarflexion = 1
+            r_toe = np.exp(-5.0 * ((right_toe_angle - target_plantarflexion)**2 + (left_toe_angle - target_plantarflexion)**2))
+        self.r_toe = r_toe
+
+        r_distance = 0.0
+        if 0.4 <= phase <= 0.8:
+            cur_x = self.data.qpos[0]
+            self.max_distance = max(self.max_distance, cur_x)
+            r_distance = cur_x
+        self.r_distance = r_distance
+
+        r_stability = 0.0
+        if phase >= 1.0: 
+            com_vel = self.data.qvel[:3]
+            com_vel_norm = np.linalg.norm(com_vel)
+            r_com_vel = np.exp(-10.0 * com_vel_norm)
+            
+            root_quat = self.data.qpos[3:7]
+            root_quat_error = calc_diff_from_quaternion(root_quat, self.init_qpos[3:7]) ** 2
+            r_posture = np.exp(-10.0 * root_quat_error)
+
+            floor_contacts = self.check_floor_contact()
+            r_contacts = 1.0 if (floor_contacts["right_ankle"] and floor_contacts["left_ankle"] and
+                                not any(floor_contacts[name] for name in ['chest', 'neck', 'right_elbow', 'right_hip', 'right_knee', 'right_shoulder', 'right_wrist', 'left_elbow', 'left_hip', 'left_knee', 'left_shoulder', 'left_wrist'])) else 0.0
+            
+            joint_vel = self.data.qvel[6:]
+            joint_vel_norm = np.linalg.norm(joint_vel)
+            r_joint_vel = np.exp(-5.0 * joint_vel_norm)
+            
+            w_com_vel, w_posture, w_contacts, w_joint_vel = 0.3, 0.3, 0.2, 0.2
+            r_stability = w_com_vel * r_com_vel + w_posture * r_posture + w_contacts * r_contacts + w_joint_vel * r_joint_vel
+
+        # Weight rewards based on phase
+        if phase < 1.0:
+            if self.set_mode == "jump":
+                w_G, w_S, w_stab, w_dist, w_toe = 0.4, 0.3, 0.0, 0.0, 0.3
+            elif self.set_mode == "jumpDistStable":
+                w_G, w_S, w_stab, w_dist = 0.4, 0.2, 0.0, 0.1, 0.3
+        else:
+            w_G, w_S, w_stab, w_dist, w_toe = 0.0, 0.0, 1.0, 0.0, 0.0  # Post-jump: only stability
+        total_reward = w_G * imitation_r + w_S * r_height + w_stab * r_stability + w_dist * r_distance + w_toe * r_toe
+
+        self.rewards = [pose_r, vel_r, ee_r, com_r, r_stability]
+
+        self.cur_t += 1
+        self.idx_curr += 1
+        self.idx_curr = self.idx_curr % self.mocap_data_len
+
+        # print(self.rewards)
+        return total_reward
+    
+    def compute_torque(self, action):
+        joint_names = [
+            ('chest_x', 200, 1), ('chest_y', 200, 1), ('chest_z', 200, 1),
+            ('neck_x', 50, 1), ('neck_y', 50, 1), ('neck_z', 50, 1),
+            ('right_shoulder_x', 100, 1), ('right_shoulder_y', 100, 1), ('right_shoulder_z', 100, 1), ('right_elbow', 60, 5),
+            ('left_shoulder_x', 100, 1), ('left_shoulder_y', 100, 1), ('left_shoulder_z', 100, 1), ('left_elbow', 60, 5),
+            ('right_hip_x', 200, 1), ('right_hip_y',400, 5), ('right_hip_z', 200, 1), ('right_knee', 400, 5),
+            ('right_ankle_x', 90, 1), ('right_ankle_y', 200, 5), ('right_ankle_z', 90, 1),
+            ('left_hip_x', 200, 1), ('left_hip_y', 400, 5), ('left_hip_z', 200, 1), ('left_knee', 400, 5),
+            ('left_ankle_x', 90, 1), ('left_ankle_y', 200, 5), ('left_ankle_z', 90, 1), ('right_toe', 75, 5), 
+            ('left_toe', 75, 5)
+        ]
+        
+        joint_to_body = {
+            'chest_x': 'chest', 'chest_y': 'chest', 'chest_z': 'chest',
+            'neck_x': 'neck', 'neck_y': 'neck', 'neck_z': 'neck',
+            'right_shoulder_x': 'right_shoulder', 'right_shoulder_y': 'right_shoulder', 'right_shoulder_z': 'right_shoulder',
+            'right_elbow': 'right_elbow',
+            'left_shoulder_x': 'left_shoulder', 'left_shoulder_y': 'left_shoulder', 'left_shoulder_z': 'left_shoulder',
+            'left_elbow': 'left_elbow',
+            'right_hip_x': 'right_hip', 'right_hip_y': 'right_hip', 'right_hip_z': 'right_hip',
+            'right_knee': 'right_knee',
+            'right_ankle_x': 'right_ankle', 'right_ankle_y': 'right_ankle', 'right_ankle_z': 'right_ankle',
+            'left_hip_x': 'left_hip', 'left_hip_y': 'left_hip', 'left_hip_z': 'left_hip',
+            'left_knee': 'left_knee',
+            'left_ankle_x': 'left_ankle', 'left_ankle_y': 'left_ankle', 'left_ankle_z': 'left_ankle', 'left_toe': 'left_toe',
+            'right_toe': 'right_toe'
+        }
+
+        dt = self.model.opt.timestep
+        ctrl_joint = action  # Shape: (28,)
+        qpos = self.data.qpos.copy()  # Shape: (39,) [7 free joint + 32 actuated]
+        qvel = self.data.qvel.copy()  # Shape: (38,) [6 free joint + 32 actuated]
+        
+        k_p = np.zeros(self.ndof)
+        k_d = np.zeros(self.ndof)
+        gear = np.zeros(self.ndof)
+        
+        ind = self.get_expert_index(self.cur_t)
+        if ind > self.mocap_data_len - 1:
+            ind = self.mocap_data_len - 1
+        base_pose = self.motion.data_config[ind][7:]  # Current expert pose
+        target_pos = np.zeros(self.ndof)
+        phase = self.get_phase()
+        
+        for i, (joint_name, gears, scale) in enumerate(joint_names):
+            body_part = joint_to_body[joint_name]
+            if joint_name in ["right_knee", "left_knee", "right_hip_y", "left_hip_y", "right_toe", "left_toe"]:
+                k_p[i] = PARAMS_KP_KD_TOE[body_part][0] * 0.5
+                k_d[i] = PARAMS_KP_KD_TOE[body_part][1] * 0.5
+            else:
+                k_p[i] = PARAMS_KP_KD_TOE[body_part][0] * 1.0
+                k_d[i] = PARAMS_KP_KD_TOE[body_part][1] * 2.0
+            # if phase > 1.0:  # Post-landing: lower gains for stability
+            #     if joint_name in ["right_knee", "left_knee", "right_hip_y", "left_hip_y"]:
+            #         k_p[i] = PARAMS_KP_KD[body_part][0] * 0.3
+            #         k_d[i] = PARAMS_KP_KD[body_part][1] * 1.0
+            #     elif joint_name in ["right_ankle_y", "left_ankle_y"]:
+            #         k_p[i] = PARAMS_KP_KD[body_part][0] * 0.5
+            #         k_d[i] = PARAMS_KP_KD[body_part][1] * 1.5
+            gear[i] = gears
+            target_pos[i] = base_pose[i] + ctrl_joint[i] * scale
+            # target_pos[i] = np.clip(target_pos[i], self.joint_ranges[i, 0], self.joint_ranges[i, 1])
+        
+        qpos_err = np.zeros(self.model.nv)
+        qvel_err = np.zeros(self.model.nv)
+
+        # qpos_err[6:] = qpos[7:] - target_pos
+        qpos_err[6:] = qpos[7:] + qvel[6:] * dt - target_pos
+        qvel_err = qvel
+        q_accel = self.compute_desired_accel(qpos_err, qvel_err, k_p, k_d)
+        qvel_err += q_accel * dt
+        controls = -k_p * qpos_err[6:] - k_d * qvel_err[6:]
+        controls /= gear
+        controls = np.clip(controls, -1, 1)
+        # print(f"Target pos: {np.array(controls[self.right_knee_id])}")
+
+        self.max_torque = np.max(np.abs(controls * gear))
+        self.pos_err = np.linalg.norm(qpos_err[6:])
+        self.vel_err = np.linalg.norm(qvel_err[6:])
+        return controls
+
+    def compute_desired_accel(self, qpos_err, qvel_err, k_p, k_d):
+        import numpy as np
+        from scipy.linalg import cho_factor, cho_solve
+        import mujoco
+
+        dt = self.model.opt.timestep
+        nv = self.model.nv
+        M = np.zeros((nv, nv))
+        mujoco.mj_fullM(self.model, M, self.data.qM)
+        C = self.data.qfrc_bias.copy()
+        
+        K_p = np.diag(np.concatenate([np.zeros(6), k_p]))
+        K_d = np.diag(np.concatenate([np.zeros(6), k_d]))
+        
+        q_accel = cho_solve(
+            cho_factor(M + K_d * dt, overwrite_a=True, check_finite=False),
+            -C[:, None] - K_p.dot(qpos_err[:, None]) - K_d.dot(qvel_err[:, None]),
+            overwrite_b=True,
+            check_finite=False
+        )
+        return q_accel.squeeze()
+    
+    def step(self, action):
+        self.prev_bquat = self.bquat.copy()
+
+        action = self.compute_torque(action)
+        self.do_simulation(action, self.frame_skip)
+        self.bquat = self.get_body_quat()
+
+        # ind = self.get_ee_index()
+        ind = self.get_expert_index(self.cur_t + self.start_ind)
+        if ind > self.mocap_data_len - 1:
+            ind = self.mocap_data_len - 1
+        expert_ee_pos = self.get_expert_attr('ee_pos', ind)
+
+        for i, site_name in enumerate(self.expert_ee_sites):
+            site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+            self.data.site_xpos[site_id] = expert_ee_pos[i*3:(i+1)*3]
+
+        humanoid_com = self.get_com()  # Humanoid CoM
+        expert_com = self.get_expert_attr('com', ind)  # Expert CoM
+        self.data.site_xpos[self.humanoid_com_site_id] = humanoid_com
+        self.data.site_xpos[self.expert_com_site_id] = expert_com
+
+        reward = self.reward()
+
+        observation = self._get_obs()
+        if self.render_mode == "human":
+            self.render()
+
+        truncated = False
+        info = {
+            'reward_task': self.imitation_r,
+            'reward_style': self.r_height
+        }
+        
+        done = self.terminated
+        floor_contacts = self.check_floor_contact()
+        critical_contacts = any(floor_contacts[name] for name in ['chest', 'neck', "right_elbow", "right_hip", "right_knee",
+                                                                    "right_shoulder", "right_wrist", "left_elbow", "left_hip",
+                                                                    "left_knee", "left_shoulder", "left_wrist"])
+        # end = self.cur_t + self.start_ind >= self.mocap_data_len
+        done = self.terminated or critical_contacts
+        if self.terminated or critical_contacts:
+            reward -= 1.0
+        return observation, reward, done, truncated, info
+        
+    def reset_model(self):
+        ind = 0 if self.fixed_start else np.random.randint(self.mocap_data_len)
+        self.start_ind = ind
+        qpos = self.motion.data_config[ind].copy()
+        qvel = self.motion.data_vel[ind].copy()
+        self.set_state(qpos, qvel)
+        self.bquat = self.get_body_quat()
+        self.cur_t = 0
+        self.idx_curr = 0
+        self.max_distance = 0.0
+        self.r_height = 0.0
+        self.imitation_r = 0.0
+        self.rewards = [0, 0, 0, 0, 0, 0]
+        return np.array(self._get_obs())
+    
+if __name__ == "__main__":
+    curr_path = os.getcwd()
+    modelPath = curr_path + "/assets/xml/humanoid_jump_toe.xml"
+    filePath = curr_path + "/motions/humanoid3d_jump.txt"
+    
+    env = HumanoidEnv(modelPath, filePath, render_mode="human")
+    obs = env._get_obs()
+    action = np.zeros(env.action_dim)
+    right_knee_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "right_knee")
+    left_knee_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "left_knee")
+    
+    env.set_mode = "jump"
+    actuator_joint_ids = [env.model.actuator_trnid[i, 0] for i in range(env.model.nu)]
+    right_knee_actuator_idx = actuator_joint_ids.index(right_knee_id)
+    left_knee_actuator_idx = actuator_joint_ids.index(left_knee_id)
+    
+    action[right_knee_actuator_idx] = 0.0
+    action[left_knee_actuator_idx] = 0.0
+    
+    import time as t
+    for _ in range(10000):
+        env.fixed_start = True  # Set fixed start to True for consistent behavior
+        obs, reward, done, truncated, info = env.step(action)
+        env.render()
+        if done or truncated:
+            env.reset_model()
+        t.sleep(1.0 / env.metadata["render_fps"])
+    
+    env.close()
