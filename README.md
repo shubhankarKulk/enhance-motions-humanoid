@@ -7,36 +7,41 @@ This repository contains the code and resources for the Master Thesis titled "En
 This project explores the integration of imitation learning and reinforcement learning to enhance explosive motion capabilities in humanoid robotics. The implementation leverages the MuJoCo physics engine and the Proximal Policy Optimization (PPO) algorithm to train a humanoid robot to perform dynamic jumps, with adaptive parameter tuning and motion trail visualization.
 
 ## Installation
-Clone the repository:
-```git clone https://github.com/yourusername/humanoid-robotics-motion.git```
-```cd humanoid-robotics-motion```
+```bash
+git clone https://github.com/yourusername/humanoid-robotics-motion.git
+cd humanoid-robotics-motion
+```
 
-# Install dependencies:
+### Install dependencies:
 check ```environment.yml```
 
-
-# Set up MuJoCo:
+### Set up MuJoCo:
 Refer: https://gist.github.com/saratrajput/60b1310fe9d9df664f9983b38b50d5da
 
-# Usage
+### Usage
 The main script main_mod.py serves as the entry point for training, evaluating, or capturing motion trails of the humanoid robot. Use the following commands based on your needs:
 
-# Train the Model:
+### Train the Model:
 Run the training loop with the default configuration:
-```python main_mod.py --config assets/yaml/humanoidJump.yaml --train```
+```bash
+python main_mod.py --config assets/yaml/humanoidJump.yaml --train
+```
 
 This will train the PPO agent for 30 million steps with the specified hyperparameters (e.g., learning rates, horizon, etc.) and save checkpoints every 500,000 steps.
 
-# Evaluate the Model:
+### Evaluate the Model:
 Load a pre-trained model and evaluate its performance:
-```python main_mod.py --config assets/yaml/humanoidJump.yaml --eval --no-train --model_index 14000```
+```bash
+python main_mod.py --config assets/yaml/humanoidJump.yaml --eval --no-train --model_index 14000
+```
 
 Use ```--best``` to load the best model instead of a specific index.
 
-
-Capture Motion Trail:
+### Capture Motion Trail:
 Generate a motion trail visualization:
-```python main_mod.py --config assets/yaml/humanoidJump.yaml --capture --no-train --model_index 14000```
+```bash
+python main_mod.py --config assets/yaml/humanoidJump.yaml --capture --no-train --model_index 14000
+```
 
 This will create a PNG file (jump_motion_progression_*.png) showing the motion progression over frames.
 
