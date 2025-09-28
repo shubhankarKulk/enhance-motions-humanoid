@@ -4,6 +4,7 @@ import copy
 import torch
 import math
 
+# Taken From: https://github.com/XinJingHao/PPO-Continuous-Pytorch
 
 class PPO_Agent(object):
     def __init__(self, config):

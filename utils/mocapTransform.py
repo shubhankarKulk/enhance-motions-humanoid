@@ -13,6 +13,8 @@ from utils.mocapUtils import *
 from utils.transformUtils import *
 from utils.envUtils import *
 
+#Taken From: https://github.com/mingfeisun/DeepMimic_mujoco
+
 class MocapDM(object):
     def __init__(self):
         self.num_bodies = len(BODY_DEFS)
