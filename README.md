@@ -24,30 +24,25 @@ The main script main_mod.py serves as the entry point for training, evaluating, 
 ### Train the Model:
 Run the training loop with the default configuration:
 ```bash
-python main_mod.py --config assets/yaml/humanoidJump.yaml --train
+python main.py
 ```
 
 This will train the PPO agent for 30 million steps with the specified hyperparameters (e.g., learning rates, horizon, etc.) and save checkpoints every 500,000 steps.
 
 ### Evaluate the Model:
-Load a pre-trained model and evaluate its performance:
+Load a pre-trained model and evaluate its performance by changing the parameter ```humanoidJump.yaml``` file ```render``` to ```True```:
 ```bash
-python main_mod.py --config assets/yaml/humanoidJump.yaml --eval --no-train --model_index 14000
+python main.py
 ```
 
-Use ```--best``` to load the best model instead of a specific index.
+Use ```best``` to load the best model instead of a specific index.
 
-### Capture Motion Trail:
-Generate a motion trail visualization:
-```bash
-python main_mod.py --config assets/yaml/humanoidJump.yaml --capture --no-train --model_index 14000
-```
-
-This will create a PNG file (jump_motion_progression_*.png) showing the motion progression over frames.
+## Working
+https://github.com/user-attachments/assets/753a337b-c837-46e5-83a7-eb297563c143
 
 ## Configuration
 
-The configuration is loaded from humanoidJump.yaml. Modify parameters such as max_train_steps, a_lr, c_lr, or log_std to adjust the training process.
+The configuration is loaded from ```humanoidJump.yaml```. Modify parameters such as max_train_steps, a_lr, c_lr, or log_std to adjust the training process.
 Ensure the model and mocap_file paths in the YAML file point to the correct locations.
 
 Find the full report at [Report](masters_thesis_report.pdf)

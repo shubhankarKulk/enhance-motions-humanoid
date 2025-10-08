@@ -14,6 +14,8 @@ from utils.transformUtils import *
 import mujoco
 from scipy.linalg import cho_solve, cho_factor
 
+#Assistance used from: https://github.com/Khrylx/RFC
+
 class HumanoidEnv(MujocoEnv, utils.EzPickle):
     metadata = {
         "render_modes": [
@@ -108,6 +110,14 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         self.left_hip_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "left_hip")
         self.actuator_ids = [self.model.actuator(j).id for j in self.joint_names]
         self.max_expert_distance = self._compute_max_expert_distance()
+
+        self.base_body_masses = {name: self.model.body_mass[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)]
+                             for name in self.body_names_to_check if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) != -1}
+        self.modified_body_masses = self.base_body_masses.copy()
+
+        self.base_actuator_gears = self.model.actuator_gear.copy()
+        self.modified_actuator_gears = self.base_actuator_gears.copy()
+        self.stableCounter = 0
 
     @property
     def is_healthy(self):
@@ -299,14 +309,14 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
 
         if prev_bquat is None:
             prev_bquat = self.bquat.copy()
-        
+
         # Current state
         cur_com = self.get_com()
         cur_bquat = self.get_body_quat()
         cur_bangvel = self.get_angvel(prev_bquat, cur_bquat, self.dt)
         cur_ee = self.get_ee_pos()
 
-        # Reference state
+        # Reference state from expert
         e_ee = self.get_expert_attr('ee_pos', ind)
         e_bquat = self.get_expert_attr('bquat', ind)
         e_bangvel = self.get_expert_attr('bangvel', ind)
@@ -317,14 +327,15 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         vel_r = compute_velocity_reward(cur_bangvel[3:], e_bangvel[3:])
         ee_r = compute_end_effector_reward(cur_ee, e_ee)
         com_r = compute_com_reward(cur_com, e_com)
+        w_p, w_v, w_e, w_c = 0.6, 0.1, 0.15, 0.15
+        imitation_r = w_p * pose_r + w_v * vel_r + w_e * ee_r + w_c * com_r
+        self.imitation_r = imitation_r
 
+        # Height reward
         cur_z = self.data.qpos[2]
         e_z = self.get_expert_attr('qpos', ind)[2]
-        height_r = com_height_reward(cur_z, e_z)
-
-        w_p, w_v, w_e, w_c, w_r = 0.5, 0.05, 0.15, 0.2, 0.1
-        imitation_r = w_p * pose_r + w_v * vel_r + w_e * ee_r + w_c * com_r + w_r * height_r
-        self.imitation_r = imitation_r
+        r_height = com_height_reward(cur_z, e_z)
+        self.r_height = r_height
 
         # Task rewards
         cur_x = self.data.qpos[0]
@@ -357,6 +368,39 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         if non_foot_contact:
             contact_score *= 0.2
 
+        # Squat depth reward
+        r_squat = 0.0
+        if phase < 0.42:
+            target_knee_angle = -0.8
+            left_knee_angle = self.data.qpos[self.left_knee_id]
+            right_knee_angle = self.data.qpos[self.right_knee_id]
+            knee_error = np.mean([abs(left_knee_angle - target_knee_angle), abs(right_knee_angle - target_knee_angle)])
+            r_squat = np.exp(-7.0 * knee_error)
+
+        # Forward leg extension reward
+        r_leg_extension = 0.0
+        avg_foot_x = np.mean([left_foot[0], right_foot[0]])
+        foot_com_distance = avg_foot_x - cur_com[0]
+        if 0.5 <= phase < 0.6:
+            target_distance = 0.2
+            r_leg_extension = np.exp(-10.0 * abs(foot_com_distance - target_distance))
+        elif phase >= 0.6:
+            target_distance = 0.35
+            r_leg_extension = np.exp(-10.0 * abs(foot_com_distance - target_distance))
+
+        # Stability reward
+        r_stability = 0.0
+        if phase >= 0.7 and phase <= 1.0:  # Landing phase
+            com_vel = self.data.qvel[:3]
+            com_vel_norm = np.linalg.norm(com_vel)
+            r_com_vel = np.exp(-7.0 * com_vel_norm)
+            r_stability = 0.5 * contact_score + 0.5 * r_com_vel
+        elif phase < 0.42:  # Preparation phase
+            r_stability = contact_score
+        elif 0.42 <= phase < 0.7:  # Flight phase
+            forward_placement = np.mean([left_foot[0] - cur_com[0], right_foot[0] - cur_com[0]])
+            r_stability = forward_placement
+
         # Post-landing upright posture reward
         r_upright = 0.0
         if phase > 0.7:  # Post-landing phase
@@ -367,68 +411,93 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
             torso_error = np.arccos(np.clip(np.dot(z_axis, vertical_axis), -1.0, 1.0))
             r_torso = np.exp(-10.0 * torso_error)
 
+            # Knee extension (near 0 radians for straight legs)
+            left_knee_angle = self.data.qpos[self.left_knee_id]
+            right_knee_angle = self.data.qpos[self.right_knee_id]
+            knee_error = np.mean([abs(left_knee_angle), abs(right_knee_angle)])  # Target 0 radians
+            r_knee = np.exp(-10.0 * knee_error)
+
+            # Hip extension (near 0 radians for upright posture)
+            left_hip_angle = self.data.qpos[self.left_hip_id]
+            right_hip_angle = self.data.qpos[self.right_hip_id]
+            hip_error = np.mean([abs(left_hip_angle), abs(right_hip_angle)])  # Target 0 radians
+            r_hip = np.exp(-10.0 * hip_error)
+
             # COM velocity (ensure stillness)
             com_vel = self.data.qvel[:3]
             com_vel_norm = np.linalg.norm(com_vel)
             r_com_vel = np.exp(-7.0 * com_vel_norm)
 
-            r_upright = 0.5 * r_torso + 0.3 * r_com_vel + 0.2 * contact_score
+            r_upright = 0.3 * r_torso + 0.2 * r_knee + 0.2 * r_hip + 0.2 * contact_score + 0.1 * r_com_vel
 
-        # Distance reward
-        r_distance = 0.0
-        avg_foot_x = np.mean([left_foot[0], right_foot[0]])
-        if 0.3 <= phase <= 0.7:
-            # Forward distance (COM displacement)
-            forward_distance = cur_x - self.jump_start_x
-
-            # Foot distance (average foot x-position relative to start)
-            avg_foot_x = np.mean([left_foot[0], right_foot[0]])
-            foot_distance = avg_foot_x - self.jump_start_x
-
-            # Velocity (forward and vertical)
+        # Takeoff velocity reward
+        r_takeoff_vel = 0.0
+        if 0.3 < phase < 0.4:
             com_vel = self.data.qvel[:3]
             forward_vel = np.clip(com_vel[0], 0, 5.0) / 5.0
             vertical_vel = np.clip(com_vel[2], 0, 3.0) / 3.0
-            vel_bonus = 0.5 * forward_vel + 0.5 * vertical_vel
+            # print(forward_vel, vertical_vel)
+            r_takeoff_vel = 0.5 * forward_vel + 0.5 * vertical_vel
 
-            # Combined distance reward
-            r_distance = 0.4 * forward_distance + 0.4 * foot_distance + 0.2 * vel_bonus
-
+        # com_vel = self.data.qvel[:3]
+        # forward_vel = com_vel[0]
+        # vertical_vel = com_vel[2]
+        # print(forward_vel, vertical_vel)
+        
+        # Yaw penalty
         r_yaw = 0.0
         root_quat = self.data.qpos[3:7]
         yaw_angle = self.quat_to_yaw(root_quat)
         yaw_error = abs(yaw_angle)
-        
-        r_yaw = np.exp(-10.0 * yaw_error) 
+
+        pitch_angle = self.quat_to_pitch(root_quat)
+        roll_angle = self.quat_to_roll(root_quat)
+        # print(pitch_angle)
+        pitch_error = abs(pitch_angle)
+
+        r_yaw = 0.5 * np.exp(-10.0 * yaw_error) + 0.5 * np.exp(-10.0 * pitch_error) 
+
+        # Distance reward
+        r_distance = 0.0
+        if 0.42 <= phase <= 0.7:
+            forward_vel = self.data.qvel[0]
+            vel_bonus = np.clip(forward_vel, 0, 5.0) / 5.0
+            left_foot_x = self.get_foot_pos('left_ankle')[0]
+            right_foot_x = self.get_foot_pos('right_ankle')[0]
+            avg_foot_x = (left_foot_x + right_foot_x) / 2.0
+            foot_distance = avg_foot_x - self.jump_start_x
+            r_distance = 2.0 * (0.5 * forward_distance + 0.3 * foot_distance + 0.2 * vel_bonus)
 
         # Curriculum learning
         curriculum_factor = min(1.0, self.episode / 10000000)
 
         # Dynamic weights
 
-        if self.set_mode == "jumpMimicReset":
-            w_S = 1.0
-            w_dist = 0.0
-            w_sym = 0.0
-            w_upright = 0.0
-            w_yaw = 0.0
-        else:
-            w_S = 0.5 * (1.0 - curriculum_factor) + 0.1
-            w_dist = 0.5 * curriculum_factor + 0.3
-            w_sym = 0.1 * curriculum_factor + 0.05
-            w_upright = 0.3 * curriculum_factor + 0.1 if phase > 0.7 else 0.0  # Post-landing only
-            w_yaw = 0.2 * (1.0 - curriculum_factor) + 0.05
+        w_S = 0.5 * (1.0 - curriculum_factor) + 0.1
+        w_G = 0.2 - 0.1 * curriculum_factor
+        w_stab = 0.2 * curriculum_factor + 0.05
+        w_dist = 0.5 * curriculum_factor + 0.3
+        w_squat = 0.3 * curriculum_factor + 0.15
+        w_leg = 0.3 * curriculum_factor + 0.15
+        w_sym = 0.1 * curriculum_factor + 0.05
+        w_takeoff = 0.2 * curriculum_factor + 0.1
+        w_yaw = 0.2 * (1.0 - curriculum_factor) + 0.05
+        w_upright = 0.3 * curriculum_factor + 0.1 if phase > 1.0 else 0.0  # Post-landing only
 
-        total_reward = (w_S * imitation_r +
-                        w_dist * r_distance + w_sym * r_symmetry + w_upright * r_upright + w_yaw * r_yaw)
+        total_reward = (w_S * imitation_r + w_G * r_height + w_stab * r_stability +
+                        w_dist * r_distance + w_squat * r_squat + w_leg * r_leg_extension +
+                        w_sym * r_symmetry + w_takeoff * r_takeoff_vel + w_yaw * r_yaw +
+                        w_upright * r_upright)
         
-        self.rewards = [pose_r, vel_r, ee_r, com_r, height_r, r_distance, r_symmetry, r_upright]
+        self.rewards = [pose_r, vel_r, ee_r, com_r, r_stability, r_distance, r_squat, r_leg_extension, r_symmetry, r_takeoff_vel, r_yaw, r_upright]
 
         self.cur_t += 1
         self.idx_curr += 1
         self.idx_curr = self.idx_curr % self.mocap_data_len
 
         return total_reward
+    
+    # This works for iterations 7000, 8000, 12500, 14000
 
     def quat_to_yaw(self, quat):
         q0, q1, q2, q3 = quat
@@ -563,7 +632,6 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         self.do_simulation(action, self.frame_skip)
         self.bquat = self.get_body_quat()
 
-        # ind = self.get_ee_index()
         ind = self.get_expert_index(self.cur_t + self.start_ind)
         if ind > self.mocap_data_len - 1:
             ind = self.mocap_data_len - 1
@@ -603,15 +671,16 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         return observation, reward, done, truncated, info
         
     def reset_model(self):
+        self.stableCounter = 0
         self.episode = getattr(self, 'episode', 0) + 1
         ind = 0 if self.fixed_start else np.random.randint(self.mocap_data_len)
         self.start_ind = ind
-        # if self.set_mode == "jumpReset" or self.set_mode == "jumpMimicReset":
-        qpos = self.motion.data_config[ind].copy()
-        qvel = self.motion.data_vel[ind].copy()
-        # elif self.set_mode == "jumpResetInit_Mod" or self.set_mode == "jumpResetInit_ModMimic":
-        #     qpos = self.init_qpos
-        #     qvel = self.init_qvel
+        if self.set_mode == "jumpInit_og":
+            qpos = self.motion.data_config[ind].copy()
+            qvel = self.motion.data_vel[ind].copy()
+        elif self.set_mode == "jumpInit_Mod":
+            qpos = self.init_qpos
+            qvel = self.init_qvel
         self.set_state(qpos, qvel)
         self.bquat = self.get_body_quat()
         self.cur_t = 0
@@ -621,32 +690,3 @@ class HumanoidEnv(MujocoEnv, utils.EzPickle):
         self.imitation_r = 0.0
         self.rewards = [0, 0, 0, 0, 0, 0]
         return np.array(self._get_obs())
-    
-if __name__ == "__main__":
-    curr_path = os.getcwd()
-    modelPath = curr_path + "/assets/xml/humanoid_jump.xml"
-    filePath = curr_path + "/motions/humanoid3d_jump.txt"
-    
-    env = HumanoidEnv(modelPath, filePath, render_mode="human")
-    obs = env._get_obs()
-    action = np.zeros(env.action_dim)
-    right_knee_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "right_knee")
-    left_knee_id = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "left_knee")
-    
-    actuator_joint_ids = [env.model.actuator_trnid[i, 0] for i in range(env.model.nu)]
-    right_knee_actuator_idx = actuator_joint_ids.index(right_knee_id)
-    left_knee_actuator_idx = actuator_joint_ids.index(left_knee_id)
-    
-    action[right_knee_actuator_idx] = 0.0
-    action[left_knee_actuator_idx] = 0.0
-    
-    import time as t
-    for _ in range(10000):
-        env.fixed_start = True  # Set fixed start to True for consistent behavior
-        obs, reward, done, truncated, info = env.step(action)
-        env.render()
-        if done or truncated:
-            env.reset_model()
-        t.sleep(1.0 / env.metadata["render_fps"])
-    
-    env.close()

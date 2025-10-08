@@ -1,7 +1,6 @@
 dvc: "cpu"
 render: True
 best: False
-capture: False
 model_index: 14000 
 horizon: 2048
 max_train_steps: 30000000
